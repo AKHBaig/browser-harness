@@ -33,6 +33,8 @@ SOCK = ipc.sock_addr(NAME)
 LOG = str(ipc.log_path(NAME))
 PID = str(ipc.pid_path(NAME))
 BUF = 500
+try: IDLE_EXIT_S = float(os.environ.get("BH_IDLE_EXIT_S", "1800") or 0)  # 0 = never
+except ValueError: IDLE_EXIT_S = 1800.0
 PROFILES = [
     Path.home() / "Library/Application Support/Google/Chrome",
     Path.home() / "Library/Application Support/Google/Chrome Canary",
@@ -187,6 +189,7 @@ class Daemon:
         self.events = deque(maxlen=BUF)
         self.dialog = None
         self.stop = None  # asyncio.Event, set inside start()
+        self.last_used = time.monotonic()  # any IPC request (incl. ping) counts as use
 
     async def attach_first_page(self):
         """Attach to a real page (or any page). Sets self.session. Returns attached target or None."""
@@ -259,6 +262,7 @@ class Daemon:
         self.cdp._event_registry.handle_event = tap
 
     async def handle(self, req):
+        self.last_used = time.monotonic()
         # Token guard for Windows TCP loopback: any local process can otherwise
         # connect and issue CDP commands. expected_token() is None on POSIX so
         # this check is a no-op there (AF_UNIX + chmod 600 is the boundary).
@@ -356,6 +360,18 @@ class Daemon:
             return {"error": msg}
 
 
+async def idle_watch(d, idle_s, now=time.monotonic, sleep=asyncio.sleep):
+    """Set d.stop once no request has arrived for idle_s seconds, so shutdown takes the normal path
+    (dedicated-tab cleanup and stop_remote(), never an orphaned billable browser). idle_s <= 0: never."""
+    if idle_s <= 0: return
+    while True:
+        await sleep(min(30.0, max(idle_s / 4, 0.05)))
+        if now() - d.last_used >= idle_s:
+            log(f"idle for {idle_s:g}s: shutting down")
+            d.stop.set()
+            return
+
+
 async def serve(d):
     async def handler(reader, writer):
         try:
@@ -376,20 +392,26 @@ async def serve(d):
 
     serve_task = asyncio.create_task(ipc.serve(NAME, handler))
     stop_task = asyncio.create_task(d.stop.wait())
+    idle_task = asyncio.create_task(idle_watch(d, IDLE_EXIT_S))
     await asyncio.sleep(0.05)  # let serve() bind so sock_addr() resolves to the live endpoint
     log(f"listening on {ipc.sock_addr(NAME)} (name={NAME}, remote={REMOTE_ID or 'local'})")
+    owner = True
     try:
         await asyncio.wait({serve_task, stop_task}, return_when=asyncio.FIRST_COMPLETED)
         if serve_task.done(): await serve_task  # surfaces a serve crash
+    except ipc.AlreadyRunning:
+        owner = False  # the endpoint is the live daemon's: never unlink it
+        raise
     finally:
-        for t in (serve_task, stop_task):
+        for t in (serve_task, stop_task, idle_task):
             t.cancel()
             try: await t
             except (asyncio.CancelledError, Exception): pass
-        ipc.cleanup_endpoint(NAME)
+        if owner: ipc.cleanup_endpoint(NAME)
 
 
 async def main():
+    if already_running(): raise ipc.AlreadyRunning(NAME)  # before the CDP connect: a duplicate must not touch the browser
     d = Daemon()
     await d.start()
     await serve(d)
@@ -407,14 +429,21 @@ if __name__ == "__main__":
         sys.exit(0)
     open(LOG, "w").close()
     open(PID, "w").write(str(os.getpid()))
+    duplicate = False
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
         pass
+    except ipc.AlreadyRunning:  # lost the spawn race: the live daemon keeps its endpoint, pid file and cloud browser
+        duplicate = True
+        live = ipc.identify(NAME, timeout=1.0)
+        if live: open(PID, "w").write(str(live))
+        log("another daemon owns this name; exiting")
     except Exception as e:
         log(f"fatal: {e}")
         sys.exit(1)
     finally:
-        stop_remote()
-        try: os.unlink(PID)
-        except FileNotFoundError: pass
+        if not duplicate:
+            stop_remote()
+            try: os.unlink(PID)
+            except FileNotFoundError: pass

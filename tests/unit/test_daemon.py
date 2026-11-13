@@ -293,3 +293,55 @@ def test_current_tab_meta_returns_not_attached_when_no_target_id():
     assert result == {"error": "not_attached"}
     # No CDP call should have been issued.
     assert d.cdp.calls == []
+
+
+# --- daemon leak: idle exit + never bind over a live daemon ---
+
+def test_idle_watch_stops_daemon_after_idle_window():
+    d = _fresh_daemon()
+    d.stop = asyncio.Event()
+    clock = [0.0]
+    d.last_used = 0.0
+
+    async def fake_sleep(_):
+        clock[0] += 10.0
+
+    asyncio.run(daemon.idle_watch(d, 25.0, now=lambda: clock[0], sleep=fake_sleep))
+    assert d.stop.is_set() and clock[0] >= 25.0
+
+
+def test_idle_watch_activity_defers_exit():
+    d = _fresh_daemon()
+    d.stop = asyncio.Event()
+    clock = [0.0]
+    d.last_used = 0.0
+    ticks = [0]
+
+    async def fake_sleep(_):
+        clock[0] += 10.0
+        ticks[0] += 1
+        if ticks[0] <= 3: d.last_used = clock[0]  # a request lands each tick for 3 ticks
+
+    asyncio.run(daemon.idle_watch(d, 25.0, now=lambda: clock[0], sleep=fake_sleep))
+    assert clock[0] >= 3 * 10.0 + 25.0 - 10.0
+
+
+def test_idle_watch_zero_means_never():
+    d = _fresh_daemon()
+    d.stop = asyncio.Event()
+    asyncio.run(daemon.idle_watch(d, 0, now=lambda: 1e9))
+    assert not d.stop.is_set()
+
+
+def test_handle_marks_daemon_used():
+    d = _fresh_daemon()
+    d.last_used = 0.0
+    asyncio.run(d.handle({"meta": "ping"}))
+    assert d.last_used > 0.0
+
+
+def test_main_refuses_when_live_daemon_answers(monkeypatch):
+    import pytest
+    monkeypatch.setattr(daemon, "already_running", lambda: True)
+    with pytest.raises(daemon.ipc.AlreadyRunning):
+        asyncio.run(daemon.main())

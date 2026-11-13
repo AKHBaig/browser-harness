@@ -158,9 +158,17 @@ def identify(name, timeout=1.0):
         except OSError: pass
 
 
+class AlreadyRunning(Exception):
+    """Another live daemon already owns this name's endpoint."""
+
+
 async def serve(name, handler):
-    """Run the server until cancelled. handler(reader, writer) sees the same interface either way."""
+    """Run the server until cancelled. handler(reader, writer) sees the same interface either way.
+
+    Refuses to bind over a live daemon: two callers that both saw "no daemon" each spawn one, and the
+    second bind used to unlink the first's socket, leaving it running, unreachable and never exiting."""
     global _server_token
+    if ping(name, timeout=1.0): raise AlreadyRunning(name)
     if not IS_WINDOWS:
         path = str(_sock_path(name))
         if os.path.exists(path): os.unlink(path)

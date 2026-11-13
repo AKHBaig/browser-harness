@@ -105,3 +105,12 @@ def test_ping_returns_false_when_pong_field_is_missing_or_not_true(monkeypatch):
         assert ipc.ping("default", timeout=0.0) is False, (
             f"ping() should require pong is exactly True; got: {resp!r}"
         )
+
+
+def test_serve_refuses_to_bind_over_live_daemon(monkeypatch):
+    """Two spawn-racing callers: the second bind used to unlink the first's socket, orphaning it forever."""
+    import asyncio
+    import pytest
+    monkeypatch.setattr(ipc, "ping", lambda name, timeout=1.0: True)
+    with pytest.raises(ipc.AlreadyRunning):
+        asyncio.run(ipc.serve("default", lambda r, w: None))

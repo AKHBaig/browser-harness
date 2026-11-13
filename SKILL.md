@@ -32,6 +32,8 @@ browser-harness -c '
 
 run.py calls ensure_daemon() before exec — you never start/stop manually unless you want to.
 
+Daemon lifetime: one daemon per BU_NAME; a second one that loses a spawn race exits instead of taking over the endpoint. A daemon idle (no IPC request, pings included) for `BH_IDLE_EXIT_S` seconds (default 1800, 0 = never) shuts down through its normal path, which also stops its cloud browser. The next call respawns it.
+
 ### Remote browsers
 
 Use remote for parallel sub-agents (each gets its own isolated browser via a distinct BU_NAME) or on a headless server. BROWSER_USE_API_KEY must be set. start_remote_daemon, list_cloud_profiles, list_local_profiles, sync_local_profile are pre-imported.
